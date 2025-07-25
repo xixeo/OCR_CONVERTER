@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta content="width=device-width, initial-scale=1.0" name="viewport">
+    <title>OCR 업로드</title>
+    <script src="/js/progress.js"></script>
+    <script src="/js/zipDownloader.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", function () {
+
+            window.progressBar = new ProgressBar();
+
+            const uuid = localStorage.getItem("userUUID");
+            if (!uuid) return;
+
+            fetch(`/progress/check-restart-available/${uuid}`)
+                .then(response => response.json())
+                .then(shouldShow => {
+                    const restartBtn = document.getElementById("restartOCR");
+                    if (!restartBtn) return;
+
+                    if (shouldShow) {
+                        restartBtn.classList.remove("hidden");
+                        restartBtn.classList.add("visible");
+                    } else {
+                        restartBtn.classList.remove("visible");
+                        restartBtn.classList.add("hidden");
+                    }
+                })
+                .catch(error => console.error("❌ restartOCR 버튼 체크 실패:", error));
+
+
+            let downloadButton = document.getElementById("downloadButton");
+            if (downloadButton) {
+                downloadButton.addEventListener("click", function () {
+                    let includeJson = document.getElementById("includeJson").checked;
+                    ZipDownloader.download(includeJson);
+                });
+            }
+        });
+    </script>
+
+    <script>
+        function checkOCRProgress(uuid) {
+            console.log("🚀 checkOCRProgress 호출됨!");
+
+            fetch(`/progress/${uuid}`)
+                .then(response => response.json())
+                .then(data => {
+                    //let progress = Math.min(Math.round(data.progress), 100);
+                    let status = data.status;
+                    let total = data.totalFiles;
+                    let uploaded = data.uploadedFiles;
+                    let processed = data.ocrProcessedFiles;
+                    let pdfProcessed = data.pdfProcessedFiles;
+
+                    if (total <= 0) total = 1; // NaN 방지용 보정
+                    let progress = Math.min(Math.round((processed / total) * 100), 100);
+
+                    const restartBtn = document.getElementById("restartOCR");
+
+                     // 에러 상태 즉시 처리
+                    if (status === "error") {
+                        if (!window.errorShown) {
+                            window.errorShown = true; // ❗ 한번만 알림
+
+                            alert("❌ OCR 서버 연결에 문제가 발생했습니다.\n서버 상태를 확인해주세요.");
+
+                            window.progressBar.resetProgress();
+
+                            const downloadForm = document.getElementById("downloadForm");
+                            if (downloadForm) {
+                                downloadForm.classList.remove("visible");
+                                downloadForm.classList.add("hidden");
+                            }
+
+                            if (window.progressInterval) {
+                                clearInterval(window.progressInterval);
+                                window.progressInterval = null;
+                                console.log("🛑 진행률 체크 종료 (에러)");
+                            }
+
+                            setTimeout(() => {
+                                location.reload();
+                            }, 1000);
+                        }
+                        return; // 에러났을 때만 완전히 중단
+                    }
+
+
+                    // "interrupted"만 따로 처리
+                    if (status === "interrupted") {
+                        restartBtn.classList.remove("hidden");
+                        restartBtn.classList.add("visible");
+                    } else {
+                        restartBtn.classList.remove("visible");
+                        restartBtn.classList.add("hidden");
+                    }
+
+                    // 에러가 아니면 다시 초기화 (다음 오류를 위해)
+                    window.errorShown = false;
+
+
+                    if (status === "uploading") {
+                        document.getElementById("loadingMessage").innerText = `📤 파일 업로드 중... (${uploaded}/${total})`;
+                        window.progressBar.updateProgress(progress);
+                    } else if (status === "processing") {
+                        document.getElementById("loadingMessage").innerText = `🔄 OCR 변환 중... (${processed}/${total})`;
+                        window.progressBar.updateProgress(progress);
+                    } else if (status === "generating_pdf") {
+                        let pdfProgress = Math.min(Math.round((pdfProcessed / total) * 100), 100);
+                        document.getElementById("loadingMessage").innerText = `📄 PDF 생성 중... (${pdfProcessed}/${total})`;
+                        window.progressBar.updateProgress(pdfProgress);
+                    } else if (status === "completed") {
+                        console.log("OCR 변환 및 PDF 변환 완료!");
+                        window.progressBar.completeProgress();
+                        document.getElementById("loadingOverlay").style.display = "none";
+                        showDownloadButton();
+
+                        if (status !== "completed") {
+                            restartBtn.classList.remove("hidden");
+                            restartBtn.classList.add("visible");
+                        } else {
+                            restartBtn.classList.remove("visible");
+                            restartBtn.classList.add("hidden");
+                        }
+
+                        // 진행률 체크 중단
+                        if (window.progressInterval) {
+                            clearInterval(window.progressInterval);
+                            window.progressInterval = null;
+                            console.log("🛑 진행률 체크 종료");
+                        }
+                    }
+
+                })
+                .catch(error => console.error("진행률 확인 실패:", error));
+        }
+
+    </script>
+
+    <script>
+        function showDownloadButton() {
+            let downloadForm = document.getElementById("downloadForm");
+            if (downloadForm) {
+                console.log("다운로드 버튼 활성화!");
+                downloadForm.classList.remove("hidden");
+                downloadForm.classList.add("visible");
+            } else {
+                console.log("다운로드 버튼을 찾을 수 없음!");
+            }
+        }
+    </script>
+    <script>
+        let fullItemList = [];
+        let rootFolder = "";
+
+
+        // 디렉토리 조회 (탐색)
+        function loadDirectory() {
+            const input = document.getElementById("folderInput");
+            const files = input.files;
+
+            if (!files || files.length === 0) {
+                alert("먼저 폴더를 선택해주세요.");
+                return;
+            }
+
+            const treeMap = new Map();
+            rootFolder = files[0].webkitRelativePath.split("/")[0];
+
+            for (const file of files) {
+                const relativeParts = file.webkitRelativePath.split("/").slice(1);
+                let current = treeMap;
+
+                for (let i = 0; i < relativeParts.length; i++) {
+                    const part = relativeParts[i];
+                    if (i === relativeParts.length - 1) {
+                        if (!current.has("__files__")) current.set("__files__", []);
+                        current.get("__files__").push({ name: part, path: file.webkitRelativePath });
+                    } else {
+                        if (!current.has(part)) current.set(part, new Map());
+                        current = current.get(part);
+                    }
+                }
+            }
+
+            fullItemList = mapToTreeItems(treeMap, rootFolder);
+            updateDirectoryView(rootFolder);
+        }
+
+        // 폴더 트리로 변환
+        function mapToTreeItems(map, currentPath) {
+            const items = [];
+            for (const [key, value] of map.entries()) {
+                if (key === "__files__") {
+                    for (const file of value) {
+                        items.push({ type: "file", name: file.name, path: file.path });
+                    }
+                } else {
+                    const folderPath = currentPath ? `${currentPath}/${key}` : key;
+                    items.push({ type: "directory", name: key, path: folderPath });
+                    const children = mapToTreeItems(value, folderPath);
+                    items.push(...children);
+                }
+            }
+            return items;
+        }
+
+        // 디렉토리 트리 HTML 생성
+        function generateTreeHTML(items) {
+            let html = "<ul>";
+            const imageExtensions = [".jpg", ".jpeg", ".png"];
+
+            const folders = [], files = [];
+            items.forEach(item => {
+                if (item.type === "directory") folders.push(item);
+                else {
+                    const ext = item.name.substring(item.name.lastIndexOf(".")).toLowerCase();
+                    if (imageExtensions.includes(ext)) files.push(item);
+                }
+            });
+
+            folders.forEach(folder => {
+                html += `<li class="directory" onclick="handleFolderClick('${folder.path}')">📁 ${folder.name}</li>`;
+            });
+
+            files.forEach(file => {
+                html += `<li class="file">📄 ${file.name}</li>`;
+            });
+
+            html += "</ul>";
+            return html;
+        }
+
+        //  현재 폴더에 따라 화면 업데이트
+        function updateDirectoryView(currentPath) {
+            const filteredItems = fullItemList.filter(item => {
+                return item.path.startsWith(currentPath + "/") &&
+                    item.path.split("/").length === currentPath.split("/").length + 1;
+            });
+
+            document.getElementById("directoryTree").innerHTML = generateTreeHTML(filteredItems);
+            document.getElementById("breadcrumb").innerHTML = generateBreadcrumb(currentPath);
+        }
+
+        // 트리 내 클릭 시 하위 폴더 탐색
+        function handleFolderClick(folderPath) {
+            updateDirectoryView(folderPath);
+        }
+
+        // 경로 표시 Breadcrumb
+        function generateBreadcrumb(path) {
+            const parts = path.split("/");
+            let fullPath = "";
+            let html = `선택된 디렉토리 : 📂`;
+
+            parts.forEach((part, index) => {
+                if (index > 0) html += "/";
+                fullPath = index === 0 ? part : `${fullPath}/${part}`;
+                html += `<span class="breadcrumb-item" onclick="handleFolderClick('${fullPath}')" style="cursor:pointer; color: #007bff; text-decoration:underline; ">${part}</span>`;
+            });
+
+            return html;
+        }
+    </script>
+    <script>
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+                const r = Math.random() * 16 | 0;
+                const v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+    </script>
+
+    <script>
+        async function startChunkedUpload() {
+            const fileInput = document.getElementById("folderInput");
+            const files = Array.from(fileInput.files);
+            const selectedOCR = document.querySelector('input[name="ocrType"]:checked')?.value || "paddle";
+            const chunkSize = 1000;  // 1000개씩 전송으로 변경
+
+            if (!files || files.length === 0) {
+                alert("📂 업로드할 이미지 파일 없습니다.");
+                return;
+            }
+
+            const uuid = generateUUID();
+            localStorage.setItem("userUUID", uuid);
+
+            const totalChunks = Math.ceil(files.length / chunkSize);
+            const totalFiles = files.length;
+
+            // 로딩창 표시
+            const loadingOverlay = document.getElementById("loadingOverlay");
+            if (loadingOverlay) loadingOverlay.style.display = "flex";
+
+            // 진행률 초기화
+            window.progressBar = new ProgressBar();
+            window.progressBar.startProgress();
+
+            // OCR 진행률 실시간 체크 시작 (청크 업로드 도중에도 계속)
+            window.progressInterval = setInterval(() => {
+                checkOCRProgress(uuid);
+            }, 2000);
+
+            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+                const start = chunkIndex * chunkSize;
+                const end = Math.min(start + chunkSize, totalFiles);
+                const chunk = files.slice(start, end);
+
+                const formData = new FormData();
+                chunk.forEach(file => {
+                    formData.append("images", file, file.webkitRelativePath);
+                });
+
+                formData.append("ocrType", selectedOCR);
+                formData.append("uuid", uuid);
+                formData.append("totalCount", totalFiles);
+
+                try {
+                    await fetch("/upload/folder", {
+                        method: "POST",
+                        body: formData
+                    });
+                } catch (err) {
+                    console.error("❌ 업로드 실패 :", err);
+                    alert("❌ 업로드 중 문제가 발생했습니다. 다시 시도해주세요.");
+                    location.reload();
+                    return;
+                }
+            }
+        }
+    </script>
+
+
+    <script>
+        function restartOCR() {
+            console.log("restartOCR() 함수 진입");
+            const uuid = localStorage.getItem("userUUID");
+            const ocrType = localStorage.getItem("userOCRType") || "paddle";
+            const loadingOverlay = document.getElementById("loadingOverlay");
+            loadingOverlay.style.display = "flex";
+
+
+            window.progressBar = new ProgressBar();
+            window.progressBar.startProgress();
+
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", "/upload/restart-ocr", true);
+            xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+            xhr.onload = function () {
+                console.log("서버 응답 도착:", xhr.responseText);
+                if (xhr.status === 200) {
+                    const data = JSON.parse(xhr.responseText);
+                    //alert(data.message);
+
+                    // uuid가 없을 경우 fallback으로 response에서 꺼냄
+                    const realUUID = uuid || data.uuid;
+                    if (realUUID) {
+                        console.log("OCR변환 재시작");
+                        localStorage.setItem("userUUID", realUUID);
+                        checkOCRProgress(realUUID, true);
+                        window.progressInterval = setInterval(() => {
+                            checkOCRProgress(realUUID, true);
+                        }, 5000);
+                    } else {
+                        console.warn("❌ UUID가 확인되지 않아 진행률 체크가 불가능합니다.");
+                    }
+
+                } else {
+                    alert("❌ OCR 재시작 실패: " + xhr.statusText);
+                }
+            };
+
+            xhr.onerror = function () {
+                alert("❌ 요청 실패 (네트워크 오류)");
+            };
+
+            xhr.send(`uuid=${encodeURIComponent(uuid)}&ocrType=${encodeURIComponent(ocrType)}`);
+        }
+    </script>
+
+    <style>
+        ul{
+            padding: 0;
+
+            li{
+                list-style-type: none;
+                line-height: 2rem;
+                padding: 0;
+            }
+            li:not(:last-child) {
+                border-bottom: 1px solid #ebebeb;
+            }
+
+        }
+
+        .hidden {
+            opacity: 0;
+            transform: scale(0.8);
+            transition: opacity 0.5s ease-in-out, transform 0.3s ease-in-out;
+        }
+
+        .visible {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        .content-wrap {
+            width: 100%;
+            height: calc(100vh - 300px);
+            overflow: auto;
+            border: 1px solid #ccc;
+            background: #f9f9f9;
+            margin: 0;
+            padding: 10px 20px;
+            border-radius: 3px;
+            box-sizing: border-box;
+        }
+
+        .directory, .file {
+            margin-left: 20px;
+            cursor: pointer;
+        }
+
+        .directory {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .file {
+            color: #333;
+        }
+
+        #n_DirectoryPath{
+            min-width: 300px;
+            margin: 0 10px;
+        }
+
+        .breadcrumb-item {
+            cursor: pointer;
+            color: blue;
+            text-decoration: underline;
+        }
+
+        /* 로딩창 */
+        #loadingOverlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+
+        #loadingBox {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            min-width: 500px;
+        }
+
+        .custom-upload-button {
+            display: inline-block;
+            padding: 5px 8px;
+            background-color: #ededed;
+            border-left: 1px solid #ccc;
+            color: #fff;
+            cursor: pointer;
+            text-align: center;
+            font-size: 0.8rem !important;
+            font-weight: bold;
+        }
+
+        #fileCountLabel{
+            font-size: 0.8rem !important;
+            color: #707070;
+        }
+
+        .formlayout{
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            width: fit-content;
+            min-width: 260px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-right: 4px;
+        }
+
+    </style>
+</head>
+<body style="padding: 10px 20px; box-sizing: border-box;">
+
+    <h2>📂 OCR PDF 변환</h2>
+
+    <div>
+    <!-- OCR 선택 옵션 추가 -->
+
+        <div style="display: flex; align-items: center; border: 1px solid #ccc; background: #f9f9f9; border-radius: 3px; margin-bottom: 20px; padding: 10px 20px;">
+            <form id="ocrOptionForm" style="font-size: 0.88rem; margin-right: 30px;">
+                <span style="font-weight: bold;">OCR 방식 </span>
+                <input checked id="googleVision" name="ocrType" type="radio" value="google">
+                <label for="googleVision">Google Vision API</label>
+                <input id="paddle" name="ocrType" type="radio" value="paddle" checked>
+                <label for="paddle">Paddle OCR</label>
+            </form>
+            <form id="folderUploadForm" enctype="multipart/form-data" method="post" style="display: flex; align-items: center;">
+                <span style="font-size: 0.88rem; font-weight: bold; margin-right: 6px;">변환할 디렉토리 </span>
+                <div class="formlayout">
+                    <span id="fileCountLabel" style="margin-left: 10px; ">업로드 할 디렉토리를 선택하세요.</span>
+                    <label for="folderInput" class="custom-upload-button">🔍</label>
+                </div>
+                <input type="file" id="folderInput" name="images" webkitdirectory directory multiple hidden>
+
+                <input type="hidden" name="ocrType" id="ocrTypeFolder">
+                <button type="button" onclick="startChunkedUpload()" style="padding: 6px 16px; background: #157ffd; color: #fff; border: none; border-radius: 3px; cursor: pointer;"> 변환</button>
+            </form>
+        </div>
+
+        <div class="content-wrap" style="padding: 0 !important;">
+            <h4 id="breadcrumb" style="font-size: 0.9rem; margin-top: 0; padding: 14px 20px; background: #ebebeb;">디렉토리를 선택해주세요.</h4>
+        <div id="directoryTree" style="font-size: 0.9rem;"></div>
+    </div>
+
+
+
+
+    <button id="restartOCR" onclick="restartOCR()" type="button" class="hidden" style="margin-top: 10px;">
+        🔄 OCR 변환 다시 시작
+    </button>
+
+    <form id="downloadForm" th:classappend="${showDownloadButton != null and showDownloadButton} ? 'visible' : 'hidden'">
+
+        <span id="downloadMessage" >변환이 완료되었습니다!</span>
+        <label>
+            <input type="checkbox" id="includeJson" checked> JSON 포함
+        </label>
+        <button id="downloadButton" type="button" >압축파일 다운로드</button>
+    </form>
+
+    <!-- 로딩 창 -->
+    <div id="loadingOverlay">
+        <div id="loadingBox">
+            <p id="loadingMessage">🔄 업로드 대기중...</p>
+            <div class="progress-wrap" ></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById("folderInput").addEventListener("change", function () {
+            const files = this.files;
+            const fileCount = files.length;
+            const label = document.getElementById("fileCountLabel");
+
+            if (fileCount === 0) {
+                label.textContent = "선택된 파일 없음";
+            } else {
+                // 첫 번째 파일의 경로에서 최상위 폴더명 추출
+                const topFolder = files[0].webkitRelativePath.split("/")[0];
+                label.textContent = `${topFolder} (${fileCount}개의 파일 선택됨)`;
+                loadDirectory();
+            }
+        });
+
+    </script>
+</body>
+</html>
