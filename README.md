@@ -9,7 +9,7 @@
 
 ## 2. 서비스 흐름 요약
 
-![image.png](attachment:33ce9e8b-168e-48c2-a92f-f9d2f0f5aeed:image.png)
+![image.png](image.png)
 
 ---
 
